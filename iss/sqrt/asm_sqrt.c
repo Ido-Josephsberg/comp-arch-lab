@@ -82,143 +82,86 @@ static void assemble_program(char *program_name)
 
 	/* ===== MAIN PROGRAM ===== */
 
-	/* Load N from mem[1000] and store working copy */
-	asm_cmd(ADD, 2, 1, 0, 1000);  //  0: R2 = 1000
-	asm_cmd(LD,  3, 0, 2, 0);     //  1: R3 = N
-	asm_cmd(ADD, 2, 1, 0, 2000);  //  2: R2 = 2000
-	asm_cmd(ST,  0, 3, 2, 0);     //  3: mem[2000] = N
+	/* Load N from mem[1000] to R2 */
+	asm_cmd(LD,  2, 0, 1, 1000);  //  0: R2 = mem[1000] = N
+	
+	/* Initialize low, and high for binary search */
+	asm_cmd(ADD, 3, 1, 0, 1);     //  1: R3 = 1 (low)
+	asm_cmd(RSF, 5, 2, 1, 1);     //  2: R5 = R2 >> 1 (high = N//2)
+	asm_cmd(JEQ, 0, 5, 0, 14);    //  3: if high == 0, goto DONE_LITTLE_2 (14)
 
-	/* low = 1 */
-	asm_cmd(ADD, 3, 1, 0, 1);     //  4: R3 = 1
-	asm_cmd(ADD, 2, 1, 0, 2001);  //  5: R2 = 2001
-	asm_cmd(ST,  0, 3, 2, 0);     //  6: mem[2001] = 1 (low)
+	/* While (low <= high) */
+	asm_cmd(JLT, 0, 5, 3, 16);    //  4: if high < low, goto DONE (16)
+	asm_cmd(ADD, 6, 3, 5, 0);     //  5: R6 = R3 + R5 (low + high)
+	asm_cmd(RSF, 4, 6, 1, 1);	  //  6: R4 = R6 >> 1 (mid = floor((low + high) / 2))
+	asm_cmd(JEQ, 0, 0, 0, 20);	  //  7: goto SQUARE (20) (R6 = R4 * R4)
 
-	/* high = N */
-	asm_cmd(ADD, 2, 1, 0, 2000);  //  7: R2 = 2000
-	asm_cmd(LD,  3, 0, 2, 0);     //  8: R3 = N
-	asm_cmd(ADD, 2, 1, 0, 2002);  //  9: R2 = 2002
-	asm_cmd(ST,  0, 3, 2, 0);     // 10: mem[2002] = N (high)
+	/* If mid * mid <= N then update low, otherwise update high */
+	asm_cmd(JLT, 0, 2, 6, 12);    //  8: if N < mid*mid, goto TOO_BIG (12)
+	asm_cmd(JEQ, 0, 2, 6, 18);    //  9: if N == mid*mid, goto EXACT (18)
+	asm_cmd(ADD, 3, 4, 1, 1);     //  10: R3 = R4 + 1 (low = mid + 1)
+	asm_cmd(JEQ, 0, 0, 0, 4);     //  11: goto WHILE (4)
 
-	/* answer = 0 */
-	asm_cmd(ADD, 2, 1, 0, 2003);  // 11: R2 = 2003
-	asm_cmd(ST,  0, 0, 2, 0);     // 12: mem[2003] = 0 (answer)
+	/* TOO_BIG (12): high = mid - 1 */
+	asm_cmd(SUB, 5, 4, 1, 1);	  //  12: R5 = R4 - 1 (high = mid - 1)
+	asm_cmd(JEQ, 0, 0, 0, 4);     //  13: goto WHILE (4)
 
-	/* ===== LOOP (addr 13) ===== */
-	/* Load low, high */
-	asm_cmd(ADD, 2, 1, 0, 2001);  // 13: R2 = 2001
-	asm_cmd(LD,  3, 0, 2, 0);     // 14: R3 = low
-	asm_cmd(ADD, 2, 1, 0, 2002);  // 15: R2 = 2002
-	asm_cmd(LD,  4, 0, 2, 0);     // 16: R4 = high
+	/* DONE_LITTLE_2 (14): store the result (N = sqrt(N)) */
+	asm_cmd(ST,  0, 2, 1, 1001);  //  14: mem[1001] = R2 (Store N = sqrt(N) in mem[1001])
+	asm_cmd(HLT, 0, 0, 0, 0);     //  15: halt
 
-	/* if high < low, exit */
-	asm_cmd(JLT, 0, 4, 3, 50);    // 17: if high < low, goto DONE (50)
+	/* DONE (16): Store the result */
+	asm_cmd(ST, 0, 5, 1, 1001);   //  16: mem[1001] = R5 (Store answer = high in mem[1001])
+	asm_cmd(HLT, 0, 0, 0, 0);     //  17: halt
 
-	/* mid = (low + high) / 2 */
-	asm_cmd(ADD, 5, 3, 4, 0);     // 18: R5 = low + high
-	asm_cmd(ADD, 6, 1, 0, 1);     // 19: R6 = 1
-	asm_cmd(RSF, 5, 5, 6, 0);     // 20: R5 = (low+high) >> 1 = mid
+	/* EXACT (18): Store the result */
+	asm_cmd(ST, 0, 4, 1, 1001);	  //  18: mem[1001] = R4 (Store answer = mid in mem[1001])
+	asm_cmd(HLT, 0, 0, 0, 0);	  //  19: halt
 
-	/* Save mid to mem[2004] */
-	asm_cmd(ADD, 2, 1, 0, 2004);  // 21: R2 = 2004
-	asm_cmd(ST,  0, 5, 2, 0);     // 22: mem[2004] = mid
 
-	/* Save return address (29) to mem[2005] */
-	asm_cmd(ADD, 3, 1, 0, 29);    // 23: R3 = 29 (return address = instruction after call)
-	asm_cmd(ADD, 2, 1, 0, 2005);  // 24: R2 = 2005
-	asm_cmd(ST,  0, 3, 2, 0);     // 25: mem[2005] = 29
 
-	/* Set up multiply: R2 = mid, R3 = mid */
-	asm_cmd(ADD, 2, 5, 0, 0);     // 26: R2 = mid
-	asm_cmd(ADD, 3, 5, 0, 0);     // 27: R3 = mid
-
-	/* Jump to multiply subroutine at addr 60 */
-	asm_cmd(JEQ, 0, 0, 0, 60);    // 28: goto MULTIPLY (60)
-
-	/* ===== RETURN FROM MULTIPLY (addr 29) ===== */
-	/* R4 = mid * mid = mid_sq */
-
-	/* Load N from mem[2000] */
-	asm_cmd(ADD, 2, 1, 0, 2000);  // 29: R2 = 2000
-	asm_cmd(LD,  5, 0, 2, 0);     // 30: R5 = N
-
-	/* Load mid from mem[2004] */
-	asm_cmd(ADD, 2, 1, 0, 2004);  // 31: R2 = 2004
-	asm_cmd(LD,  6, 0, 2, 0);     // 32: R6 = mid
-
-	/* Compare mid_sq (R4) with N (R5) */
-	asm_cmd(JEQ, 0, 4, 5, 45);    // 33: if mid_sq == N, goto EXACT (45)
-	asm_cmd(JLT, 0, 5, 4, 41);    // 34: if N < mid_sq, goto TOO_BIG (41)
-
-	/* TOO_SMALL: mid_sq < N => answer = mid, low = mid + 1 */
-	asm_cmd(ADD, 2, 1, 0, 2003);  // 35: R2 = 2003
-	asm_cmd(ST,  0, 6, 2, 0);     // 36: mem[2003] = mid (update answer)
-	asm_cmd(ADD, 3, 6, 1, 1);     // 37: R3 = mid + 1
-	asm_cmd(ADD, 2, 1, 0, 2001);  // 38: R2 = 2001
-	asm_cmd(ST,  0, 3, 2, 0);     // 39: mem[2001] = low = mid + 1
-	asm_cmd(JEQ, 0, 0, 0, 13);    // 40: goto LOOP (13)
-
-	/* TOO_BIG (addr 41): mid_sq > N => high = mid - 1 */
-	asm_cmd(SUB, 3, 6, 1, 1);     // 41: R3 = mid - 1
-	asm_cmd(ADD, 2, 1, 0, 2002);  // 42: R2 = 2002
-	asm_cmd(ST,  0, 3, 2, 0);     // 43: mem[2002] = high = mid - 1
-	asm_cmd(JEQ, 0, 0, 0, 13);    // 44: goto LOOP (13)
-
-	/* EXACT (addr 45): answer = mid, go to DONE */
-	asm_cmd(ADD, 2, 1, 0, 2003);  // 45: R2 = 2003
-	asm_cmd(ST,  0, 6, 2, 0);     // 46: mem[2003] = mid (exact answer)
-	asm_cmd(JEQ, 0, 0, 0, 50);    // 47: goto DONE (50)
-
-	/* Padding */
-	asm_cmd(ADD, 0, 0, 0, 0);     // 48: NOP
-	asm_cmd(ADD, 0, 0, 0, 0);     // 49: NOP
-
-	/* ===== DONE (addr 50) ===== */
-	/* Store answer to mem[1001] */
-	asm_cmd(ADD, 2, 1, 0, 2003);  // 50: R2 = 2003
-	asm_cmd(LD,  3, 0, 2, 0);     // 51: R3 = answer
-	asm_cmd(ADD, 2, 1, 0, 1001);  // 52: R2 = 1001
-	asm_cmd(ST,  0, 3, 2, 0);     // 53: mem[1001] = answer
-	asm_cmd(HLT, 0, 0, 0, 0);    // 54: HALT
-
-	/* Padding to addr 60 */
-	asm_cmd(ADD, 0, 0, 0, 0);     // 55: NOP
-	asm_cmd(ADD, 0, 0, 0, 0);     // 56: NOP
-	asm_cmd(ADD, 0, 0, 0, 0);     // 57: NOP
-	asm_cmd(ADD, 0, 0, 0, 0);     // 58: NOP
-	asm_cmd(ADD, 0, 0, 0, 0);     // 59: NOP
-
-	/* ===== MULTIPLY SUBROUTINE (addr 60) ===== */
+	/* ===== SQUARE SUBROUTINE (addr 20) ===== */
 	/*
-	 * Computes R4 = R2 * R3 using shift-and-add.
-	 *   R5 = accumulator (running product)
-	 *   R6 = temp for bit testing
-	 *   Return address in mem[2005]
+	 * Computes R6 = R4 * R4.
+	 *   Input: R4 = mid
+	 *   Output: R6 = mid * mid
+	 *   Uses: R5 (multiplicand), R7 (temp for bit testing)
 	 */
-	asm_cmd(ADD, 5, 0, 0, 0);     // 60: R5 = 0 (accumulator)
+	asm_cmd(ST, 0, 7, 1, 2000);   //  20: mem[2000] = R7 (save return address)
+	asm_cmd(ST, 0, 5, 1, 1999);   //  21: mem[1999] = R5 (save register that will be used in multiply)
+	asm_cmd(ST, 0, 4, 1, 1998);   //  22: mem[1998] = R4 (save register that will be used in multiply)
+	asm_cmd(ADD, 6, 0, 0, 0);     //  23: R6 = 0 (accumulator)
+	asm_cmd(ADD, 5, 4, 0, 0);     //  24: R5 = R4 (multiplicand)
 
-	/* MULT_LOOP (addr 61) */
-	asm_cmd(JEQ, 0, 3, 0, 68);    // 61: if R3 == 0, goto MULT_DONE (68)
+	/* MULT_LOOP (addr 25) */
+	asm_cmd(JEQ, 0, 5, 0, 32);    //  25: if R5 == 0, goto MULT_DONE (32)
 
-	/* Check lowest bit of R3 */
-	asm_cmd(AND, 6, 3, 1, 1);     // 62: R6 = R3 & 1
-	asm_cmd(JEQ, 0, 6, 0, 65);    // 63: if R6 == 0, skip add (goto 65)
+	/* Check lowest bit of R4 */
+	asm_cmd(AND, 7, 5, 1, 1);     //  26: R7 = R5 & 1
+	asm_cmd(JEQ, 0, 7, 0, 29);    //  27: if R7 == 0, skip add (goto 29)
 
-	/* Bit set: accumulate */
-	asm_cmd(ADD, 5, 5, 2, 0);     // 64: R5 += R2
+	/* Add R4 to accumulator if bit set */
+	asm_cmd(ADD, 6, 6, 4, 0);     //  28: R6 += R4
 
-	/* SKIP_ADD (addr 65): shift operands */
-	asm_cmd(LSF, 2, 2, 1, 1);     // 65: R2 <<= 1
-	asm_cmd(RSF, 3, 3, 1, 1);     // 66: R3 >>= 1 (arithmetic, but R3 is positive)
-	asm_cmd(JEQ, 0, 0, 0, 61);    // 67: goto MULT_LOOP (61)
+	/* SKIP_ADD (addr 29): Update operands */
+	asm_cmd(LSF, 4, 4, 1, 1);     //  29: R4 <<= 1
+	asm_cmd(RSF, 5, 5, 1, 1);     //  30: R5 >>= 1 (arithmetic, but R5 is positive)
+	asm_cmd(JEQ, 0, 0, 0, 25);    //  31: goto MULT_LOOP (25)
 
-	/* MULT_DONE (addr 68) */
-	asm_cmd(ADD, 4, 5, 0, 0);     // 68: R4 = product
+	/* MULT_DONE (addr 32): Load original register's value */
+	asm_cmd(LD, 4, 0, 1, 1998);   //  32: R4 = mem[1998] (restore R4)
+	asm_cmd(LD, 5, 0, 1, 1999);   //  33: R5 = mem[1999] (restore R5)
+	asm_cmd(LD, 7, 0, 1, 2000);   //  34: R7 = mem[2000] (restore return address)
 
-	/* Return: load return address from mem[2005], jump to it */
-	asm_cmd(ADD, 2, 1, 0, 2005);  // 69: R2 = 2005
-	asm_cmd(LD,  3, 0, 2, 0);     // 70: R3 = mem[2005] = return address
-	asm_cmd(JIN, 0, 3, 0, 0);     // 71: jump to return address
+	/* Return to caller */
+	asm_cmd(ADD, 7, 7, 1, 1);     //  35: R7 += 1 (return address = instruction after call)
+	asm_cmd(JIN, 0, 7, 0, 0);     //  35: jump to return address
 
+
+
+	
+
+	
 	/*
 	 * Test data:
 	 * N = 25000 (stored at mem[1000])
