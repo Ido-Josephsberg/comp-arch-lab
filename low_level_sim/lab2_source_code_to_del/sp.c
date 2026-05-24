@@ -115,6 +115,63 @@ static char opcode_name[32][4] = {"ADD", "SUB", "LSF", "RSF", "AND", "OR", "XOR"
 				 "JLT", "JLE", "JEQ", "JNE", "JIN", "U", "U", "U",
 				 "HLT", "U", "U", "U", "U", "U", "U", "U"};
 
+static void update_trace(sp_t *sp)
+{
+	sp_registers_t *spro = sp->spro;
+	fprintf(inst_trace_fp, "--- instruction %d (%04x) @ PC %d (%04x) -----------------------------------------------------------\n",
+		nr_simulated_instructions, nr_simulated_instructions, spro->pc, spro->pc);
+	fprintf(inst_trace_fp, "pc = %04d, inst = %08x, opcode = %d (%s), dst = %d, src0 = %d, src1 = %d, immediate = %08x\n",
+		spro->pc, spro->inst, spro->opcode, opcode_name[spro->opcode], spro->dst, spro->src0, spro->src1, spro->immediate);
+	fprintf(inst_trace_fp, "r[0] = %08x r[1] = %08x r[2] = %08x r[3] = %08x \n",
+		0, spro->immediate, spro->r[2], spro->r[3]);
+	fprintf(inst_trace_fp, "r[4] = %08x r[5] = %08x r[6] = %08x r[7] = %08x \n",
+		spro->r[4], spro->r[5], spro->r[6], spro->r[7]);
+	fprintf(inst_trace_fp, "\n");
+	switch (spro->opcode) {
+	case ADD:
+	case SUB:
+	case LSF:
+	case RSF:
+	case AND:
+	case OR:
+	case XOR:
+	case LHI:
+		fprintf(inst_trace_fp, ">>>> EXEC: R[%d] = %d %s %d <<<<\n",
+			spro->dst, spro->alu0, opcode_name[spro->opcode], spro->alu1);
+		break;
+	case LD:
+		fprintf(inst_trace_fp, ">>>> EXEC: R[%d] = MEM[%d] = %08x <<<<\n",
+			spro->dst, spro->alu1, llsim_mem_extract_dataout(sp->sram, 31, 0));
+		break;
+	case ST:
+			fprintf(inst_trace_fp, ">>>> EXEC: MEM[%d] = R[%d] = %08x <<<<\n",
+				spro->alu1, spro->src0, spro->alu0);
+		break;
+	case JLT:
+	case JLE:
+	case JEQ:
+	case JNE:
+		fprintf(inst_trace_fp, ">>>> EXEC: %s %d, %d, %d <<<<\n",
+			opcode_name[spro->opcode], spro->alu0, spro->alu1, spro->aluout ? (spro->immediate & 0xFFFF) : (spro->pc + 1) & 0xFFFF);
+		break;
+	case JIN:
+		fprintf(inst_trace_fp, ">>>> EXEC: JIN %d <<<<\n",
+			spro->alu0);
+		break;
+	case HLT:
+		fprintf(inst_trace_fp, ">>>> EXEC: HALT at PC %04x<<<<\n",
+			spro->pc);
+		fprintf(inst_trace_fp, "sim finished at pc %d, %d instructions",
+			spro->pc, nr_simulated_instructions + 1);
+		return;
+	default:
+		/* Undefined opcode: treat as NOP */
+		fprintf(inst_trace_fp, ">>>> EXEC: UNKNOWN OPCODE %d <<<<\n", spro->opcode);
+		break;
+	}
+	fprintf(inst_trace_fp, "\n");
+}
+
 static void dump_sram(sp_t *sp)
 {
 	FILE *fp;
@@ -165,39 +222,133 @@ static void sp_ctl(sp_t *sp)
 		break;
 
 	case CTL_STATE_FETCH0:
-		/***********************************
-		 * TODO: fill here
-		 **********************************/
+		llsim_mem_read(sp->sram, spro->pc);
+		sprn->ctl_state = CTL_STATE_FETCH1;
 		break;
 
 	case CTL_STATE_FETCH1:
-		/***********************************
-		 * TODO: fill here
-		 **********************************/
+		sprn->inst = llsim_mem_extract_dataout(sp->sram, 31, 0);
+		sprn->ctl_state = CTL_STATE_DEC0;
 		break;
 
 	case CTL_STATE_DEC0:
-		/***********************************
-		 * TODO: fill here
-		 **********************************/
+		sprn->opcode = (spro->inst >> 25) & 0x1F;
+		sprn->dst = (spro->inst >> 22) & 7;
+		sprn->src0 = (spro->inst >> 19) & 7;
+		sprn->src1 = (spro->inst >> 16) & 7;
+		unsigned int immediate = (spro->inst & 0xFFFF);
+		if (immediate & 0x8000)
+			immediate |= 0xFFFF0000;
+		sprn->immediate = immediate;
+		sprn->ctl_state = CTL_STATE_DEC1;
 		break;
 
 	case CTL_STATE_DEC1:
-		/***********************************
-		 * TODO: fill here
-		 **********************************/
+		if (spro->src0 == 0)
+			sprn->alu0 = 0;
+		else if (spro->src0 == 1)
+			sprn->alu0 = spro->immediate;
+		else
+			sprn->alu0 = spro->r[spro->src0];
+		if (spro->src1 == 0)
+			sprn->alu1 = 0;
+		else if (spro->src1 == 1)
+			sprn->alu1 = spro->immediate;
+		else
+			sprn->alu1 = spro->r[spro->src1];
+		sprn->ctl_state = CTL_STATE_EXEC0;
 		break;
 
 	case CTL_STATE_EXEC0:
-		/***********************************
-		 * TODO: fill here
-		 **********************************/
+		switch (spro->opcode) {
+		case LD:
+			llsim_mem_read(sp->sram, (spro->alu1) & 0xFFFF);
+			break;
+		case ADD:
+			sprn->aluout = spro->alu0 + spro->alu1;
+			break;
+		case SUB:
+			sprn->aluout = spro->alu0 - spro->alu1;
+			break;
+		case LSF:
+			sprn->aluout = spro->alu0 << spro->alu1;
+			break;
+		case RSF:
+			sprn->aluout = spro->alu0 >> spro->alu1;
+			break;
+		case AND:
+			sprn->aluout = spro->alu0 & spro->alu1;
+			break;
+		case OR:
+			sprn->aluout = spro->alu0 | spro->alu1;
+			break;
+		case XOR:
+			sprn->aluout = spro->alu0 ^ spro->alu1;
+			break;
+		case LHI:
+			sprn->aluout = (spro->alu1 << 16) | (spro->alu0 & 0xFFFF);
+			break;
+		case JLT:
+			sprn->aluout = (spro->alu0 < spro->alu1) ? 1 : 0;
+			break;
+		case JLE:
+			sprn->aluout = (spro->alu0 <= spro->alu1) ? 1 : 0;
+			break;
+		case JEQ:
+			sprn->aluout = (spro->alu0 == spro->alu1) ? 1 : 0;
+			break;
+		case JNE:
+			sprn->aluout = (spro->alu0 != spro->alu1) ? 1 : 0;
+			break;
+		default:
+			/* other opcodes don't have ALU output */
+			break;
+		}
+		sprn->ctl_state = CTL_STATE_EXEC1;
 		break;
 
 	case CTL_STATE_EXEC1:
-		/***********************************
-		 * TODO: fill here
-		 **********************************/
+		switch (spro->opcode) {
+		case ST:
+			llsim_mem_set_datain(sp->sram, spro->alu0, 31, 0);
+			llsim_mem_write(sp->sram, spro->alu1 & 0xFFFF);
+			sprn->pc = spro->pc + 1;
+			break;
+		case LD:
+			if (spro->dst >= 2)
+				sprn->r[spro->dst] = llsim_mem_extract_dataout(sp->sram, 31, 0);
+			sprn->pc = spro->pc + 1;
+			break;
+		case JLT:
+		case JLE:
+		case JEQ:
+		case JNE:
+			if (spro->aluout) {
+				sprn->pc = spro->immediate & 0xFFFF;
+				sprn->r[7] = spro->pc;
+			}
+			else
+				sprn->pc = spro->pc + 1;
+			break;
+		case JIN:
+			sprn->pc = spro->alu0;
+			sprn->r[7] = spro->pc;
+			break;
+		case HLT:
+			dump_sram(sp);
+			llsim_stop();
+			break;
+		default:
+			if (spro->dst >= 2)
+				sprn->r[spro->dst] = spro->aluout;
+			sprn->pc = spro->pc + 1;
+			break;
+		}
+		sprn->ctl_state = (spro->opcode == HLT) ? CTL_STATE_IDLE : CTL_STATE_FETCH0;
+		// inst trace
+		update_trace(sp);
+		nr_simulated_instructions++;
+
 		break;
 	}
 }
