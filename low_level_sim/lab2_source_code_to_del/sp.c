@@ -118,6 +118,7 @@ static char opcode_name[32][4] = {"ADD", "SUB", "LSF", "RSF", "AND", "OR", "XOR"
 static void update_trace(sp_t *sp)
 {
 	sp_registers_t *spro = sp->spro;
+	fprintf(inst_trace_fp, "\n");
 	fprintf(inst_trace_fp, "--- instruction %d (%04x) @ PC %d (%04x) -----------------------------------------------------------\n",
 		nr_simulated_instructions, nr_simulated_instructions, spro->pc, spro->pc);
 	fprintf(inst_trace_fp, "pc = %04d, inst = %08x, opcode = %d (%s), dst = %d, src0 = %d, src1 = %d, immediate = %08x\n",
@@ -163,13 +164,12 @@ static void update_trace(sp_t *sp)
 			spro->pc);
 		fprintf(inst_trace_fp, "sim finished at pc %d, %d instructions",
 			spro->pc, nr_simulated_instructions + 1);
-		return;
+		break;
 	default:
 		/* Undefined opcode: treat as NOP */
 		fprintf(inst_trace_fp, ">>>> EXEC: UNKNOWN OPCODE %d <<<<\n", spro->opcode);
 		break;
 	}
-	fprintf(inst_trace_fp, "\n");
 }
 
 static void dump_sram(sp_t *sp)
