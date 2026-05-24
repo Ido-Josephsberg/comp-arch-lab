@@ -65,6 +65,19 @@ typedef struct sp_registers_s {
 	#define CTL_STATE_DEC1		4
 	#define CTL_STATE_EXEC0		5
 	#define CTL_STATE_EXEC1		6
+
+	// DMA state machine registers
+	int dma_state;
+	int dma_src;
+	int dma_dst;
+	int dma_len;
+	int dma_data;
+
+	// DMA states
+	#define DMA_STATE_IDLE		0
+	#define DMA_STATE_READ		1
+	#define DMA_STATE_WRITE		2
+	#define DMA_STATE_FLUSH		3
 } sp_registers_t;
 
 /*
@@ -103,6 +116,8 @@ static void sp_reset(sp_t *sp)
 #define LHI 7
 #define LD 8
 #define ST 9
+#define DMA 10
+#define CPY 11
 #define JLT 16
 #define JLE 17
 #define JEQ 18
@@ -111,7 +126,7 @@ static void sp_reset(sp_t *sp)
 #define HLT 24
 
 static char opcode_name[32][4] = {"ADD", "SUB", "LSF", "RSF", "AND", "OR", "XOR", "LHI",
-				 "LD", "ST", "U", "U", "U", "U", "U", "U",
+				 "LD", "ST", "DMA", "CPY", "U", "U", "U", "U",
 				 "JLT", "JLE", "JEQ", "JNE", "JIN", "U", "U", "U",
 				 "HLT", "U", "U", "U", "U", "U", "U", "U"};
 
@@ -154,6 +169,14 @@ static void update_trace(sp_t *sp)
 	case JNE:
 		fprintf(inst_trace_fp, ">>>> EXEC: %s %d, %d, %d <<<<\n",
 			opcode_name[spro->opcode], spro->alu0, spro->alu1, spro->aluout ? (spro->immediate & 0xFFFF) : (spro->pc + 1) & 0xFFFF);
+		break;
+	case DMA:
+		fprintf(inst_trace_fp, ">>>> EXEC: DMA src=%d dst=%d len=%d <<<<\n",
+			spro->alu0, spro->alu1, spro->r[spro->dst]);
+		break;
+	case CPY:
+		fprintf(inst_trace_fp, ">>>> EXEC: CPY R[%d] = %d <<<<\n",
+			spro->dst, (spro->dma_state == DMA_STATE_IDLE) ? 1 : 0);
 		break;
 	case JIN:
 		fprintf(inst_trace_fp, ">>>> EXEC: JIN %d <<<<\n",
@@ -243,21 +266,31 @@ static void sp_ctl(sp_t *sp)
 		sprn->ctl_state = CTL_STATE_DEC1;
 		break;
 
-	case CTL_STATE_DEC1:
+	case CTL_STATE_DEC1: {
+		int alu0, alu1;
 		if (spro->src0 == 0)
-			sprn->alu0 = 0;
+			alu0 = 0;
 		else if (spro->src0 == 1)
-			sprn->alu0 = spro->immediate;
+			alu0 = spro->immediate;
 		else
-			sprn->alu0 = spro->r[spro->src0];
+			alu0 = spro->r[spro->src0];
 		if (spro->src1 == 0)
-			sprn->alu1 = 0;
+			alu1 = 0;
 		else if (spro->src1 == 1)
-			sprn->alu1 = spro->immediate;
+			alu1 = spro->immediate;
 		else
-			sprn->alu1 = spro->r[spro->src1];
+			alu1 = spro->r[spro->src1];
+		sprn->alu0 = alu0;
+		sprn->alu1 = alu1;
+		if (spro->opcode == DMA) {
+			sprn->dma_src = alu0 & 0xFFFF;
+			sprn->dma_dst = alu1 & 0xFFFF;
+			sprn->dma_len = spro->r[spro->dst];
+			sprn->dma_state = DMA_STATE_READ;
+		}
 		sprn->ctl_state = CTL_STATE_EXEC0;
 		break;
+	}
 
 	case CTL_STATE_EXEC0:
 		switch (spro->opcode) {
@@ -319,6 +352,14 @@ static void sp_ctl(sp_t *sp)
 				sprn->r[spro->dst] = llsim_mem_extract_dataout(sp->sram, 31, 0);
 			sprn->pc = spro->pc + 1;
 			break;
+		case DMA:
+			sprn->pc = spro->pc + 1;
+			break;
+		case CPY:
+			if (spro->dst >= 2)
+				sprn->r[spro->dst] = (spro->dma_state == DMA_STATE_IDLE) ? 1 : 0;
+			sprn->pc = spro->pc + 1;
+			break;
 		case JLT:
 		case JLE:
 		case JEQ:
@@ -349,6 +390,47 @@ static void sp_ctl(sp_t *sp)
 		update_trace(sp);
 		nr_simulated_instructions++;
 
+		break;
+	}
+
+	// DMA state machine — runs every cycle in parallel with CPU
+	int cpu_mem_busy = (spro->ctl_state == CTL_STATE_FETCH0) ||
+	                   (spro->ctl_state == CTL_STATE_EXEC0 && spro->opcode == LD) ||
+	                   (spro->ctl_state == CTL_STATE_EXEC1 && spro->opcode == ST);
+
+	switch (spro->dma_state) {
+	case DMA_STATE_IDLE:
+		break;
+	case DMA_STATE_READ:
+		if (!cpu_mem_busy) {
+			llsim_mem_read(sp->sram, spro->dma_src);
+			sprn->dma_state = DMA_STATE_WRITE;
+		}
+		break;
+	case DMA_STATE_WRITE: {
+		int data = llsim_mem_extract_dataout(sp->sram, 31, 0);
+		sprn->dma_data = data;
+		if (!cpu_mem_busy) {
+			llsim_mem_set_datain(sp->sram, data, 31, 0);
+			llsim_mem_write(sp->sram, spro->dma_dst);
+			sprn->dma_src = spro->dma_src + 1;
+			sprn->dma_dst = spro->dma_dst + 1;
+			sprn->dma_len = spro->dma_len - 1;
+			sprn->dma_state = (spro->dma_len == 1) ? DMA_STATE_IDLE : DMA_STATE_READ;
+		} else {
+			sprn->dma_state = DMA_STATE_FLUSH;
+		}
+		break;
+	}
+	case DMA_STATE_FLUSH:
+		if (!cpu_mem_busy) {
+			llsim_mem_set_datain(sp->sram, spro->dma_data, 31, 0);
+			llsim_mem_write(sp->sram, spro->dma_dst);
+			sprn->dma_src = spro->dma_src + 1;
+			sprn->dma_dst = spro->dma_dst + 1;
+			sprn->dma_len = spro->dma_len - 1;
+			sprn->dma_state = (spro->dma_len == 1) ? DMA_STATE_IDLE : DMA_STATE_READ;
+		}
 		break;
 	}
 }
@@ -419,6 +501,11 @@ static void sp_register_all_registers(sp_t *sp)
 	llsim_register_register("sp", "immediate", 32, 0, &spro->immediate, &sprn->immediate);
 	llsim_register_register("sp", "cycle_counter", 32, 0, &spro->cycle_counter, &sprn->cycle_counter);
 	llsim_register_register("sp", "ctl_state", 3, 0, &spro->ctl_state, &sprn->ctl_state);
+	llsim_register_register("sp", "dma_state", 2, 0, &spro->dma_state, &sprn->dma_state);
+	llsim_register_register("sp", "dma_src", 16, 0, &spro->dma_src, &sprn->dma_src);
+	llsim_register_register("sp", "dma_dst", 16, 0, &spro->dma_dst, &sprn->dma_dst);
+	llsim_register_register("sp", "dma_len", 16, 0, &spro->dma_len, &sprn->dma_len);
+	llsim_register_register("sp", "dma_data", 32, 0, &spro->dma_data, &sprn->dma_data);
 }
 
 void sp_init(char *program_name)
