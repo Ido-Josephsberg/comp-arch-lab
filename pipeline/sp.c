@@ -8,14 +8,10 @@
 
 #include "llsim.h"
 
-// =============================================================================
-// Lab 3 - Pipelined SP processor
-//
-// 6-stage pipeline (F0/F1/D0/D1/E0/E1) over a Harvard memory split (srami,
-// sramd). E1 -> D1 forwarding for back-to-back ALU/LD producers; stall on an
-// E0 hazard or on a LD@E0 + ST@E1 structural conflict; predict-not-taken with
-// pipeline flush on a taken branch at E1; DMA SM running in parallel on sramd.
-// =============================================================================
+// lab3: 6 stage pipelined SP (F0/F1/D0/D1/E0/E1) plus a background DMA on sramd.
+// forwarding from exec0/exec1 into dec1, stall only on LD/CPY use and on a LD
+// at phase exec0 hitting a ST at phase exec1. branches predict not taken,
+// resolved in exec0.
 
 #define sp_printf(a...)						\
 	do {							\
@@ -88,11 +84,8 @@ typedef struct sp_registers_s {
 	int dma_len;     // remaining words to copy
 	int dma_data;    // data latched between read and write phases
 
-// DMA SM states:
-// IDLE  - nothing to do
-// READ  - issue a read on sramd
-// WRITE - read returned, issue the write
-// FLUSH - couldn't write last cycle (CPU was using sramd), retry the write
+// dma states. idle nothing pending, read issues a read on sramd, write issues
+// the write once the read came back, flush retries a write the cpu blocked.
 #define DMA_STATE_IDLE  0
 #define DMA_STATE_READ  1
 #define DMA_STATE_WRITE 2
@@ -149,10 +142,7 @@ static char opcode_name[32][4] = {"ADD", "SUB", "LSF", "RSF", "AND", "OR", "XOR"
 				 "JLT", "JLE", "JEQ", "JNE", "JIN", "U", "U", "U",
 				 "HLT", "U", "U", "U", "U", "U", "U", "U"};
 
-// Write one entry to inst_trace.txt for the instruction currently retiring at
-// E1. Format must match Lab 1's high-level ISS so the files diff cleanly.
-// All fields come from spro->exec1_* because that's the in-flight instruction
-// at the writeback stage.
+// write one inst_trace.txt line.
 static void update_trace(sp_t *sp)
 {
 	sp_registers_t *spro = sp->spro;
@@ -164,9 +154,8 @@ static void update_trace(sp_t *sp)
 		spro->exec1_pc, spro->exec1_inst, spro->exec1_opcode, opcode_name[spro->exec1_opcode],
 		spro->exec1_dst, spro->exec1_src0, spro->exec1_src1, spro->exec1_immediate);
 
-	// r[0] is hardwired to 0, r[1] always reads as the current immediate (per
-	// ISA). r[2..7] reflect the regfile *before* this instruction's writeback,
-	// which is what Lab 1 prints, so the diff stays clean.
+	// r[0] is 0, r[1] is the immediate. r[2] to r[7] are the values before this
+	// inst's writeback.
 	fprintf(inst_trace_fp, "r[0] = %08x r[1] = %08x r[2] = %08x r[3] = %08x \n",
 		0, spro->exec1_immediate, spro->r[2], spro->r[3]);
 	fprintf(inst_trace_fp, "r[4] = %08x r[5] = %08x r[6] = %08x r[7] = %08x \n",
@@ -186,7 +175,7 @@ static void update_trace(sp_t *sp)
 			spro->exec1_dst, spro->exec1_alu0, opcode_name[spro->exec1_opcode], spro->exec1_alu1);
 		break;
 	case LD:
-		// dataout was latched at the end of last cycle (E0's read); sample it now
+		// sramd dataout was latched last cycle by exec0's read, sample it now
 		fprintf(inst_trace_fp, ">>>> EXEC: R[%d] = MEM[%d] = %08x <<<<\n",
 			spro->exec1_dst, spro->exec1_alu1, llsim_mem_extract_dataout(sp->sramd, 31, 0));
 		break;
@@ -309,69 +298,87 @@ static void sp_ctl(sp_t *sp)
 	if (sp->start)
 		sprn->fetch0_active = 1;
 
-	// =====================================================================
-	// Pipeline implementation
-	// Order in this function follows the data-flow direction: F0 -> E1.
-	// We compute *defaults* per stage, and a final pass at E1 applies branch
-	// flushes by overwriting sprn->* fields. Stalls (data hazard, structural
-	// hazard) are decided up front and each stage looks at the relevant flag
-	// when picking between "advance from previous stage" and "hold in place".
-	// =====================================================================
+	// pipeline. stages computed in order from fetch0 to exec1. stalls are decided
+	// first, then each stage uses the flags to advance or hold. a taken branch
+	// flushes at the end.
 
-	// ----- Hazard detection (uses spro/old values; computed once) -----
+	// hazards (all read from spro)
 
-	// Does the instruction in E0 produce a register value that an instruction
-	// in D1 might need to read? We treat any register-writing opcode with
-	// dst >= 2 as a producer. We do NOT forward from E0 (we stall instead),
-	// because the ALU result for an E0 ALU op is only being computed this
-	// cycle (it lands in exec1_aluout next cycle), and forwarding LD's data
-	// from E0 is impossible — sramd hasn't returned it yet.
-	int e0_writes_reg = 0;
-	if (spro->exec0_active && spro->exec0_dst >= 2) {
-		switch (spro->exec0_opcode) {
-		case ADD: case SUB: case LSF: case RSF:
-		case AND: case OR:  case XOR: case LHI:
-		case LD:  case CPY:
-			e0_writes_reg = 1;
-			break;
-		default:
-			break;
-		}
-	}
+	// LD and CPY have no usable result in exec0 (load data still in flight, cpy
+	// status only known in exec1), so a dependent in dec1 stalls one cycle and
+	// gets the value forwarded from exec1 next cycle. alu ops don't stall, they
+	// forward out of exec0 below.
+	int e0_stall_producer = (spro->exec0_active && spro->exec0_dst >= 2 &&
+	                         (spro->exec0_opcode == LD || spro->exec0_opcode == CPY));
 	int data_stall = 0;
-	if (e0_writes_reg && spro->dec1_active) {
+	if (e0_stall_producer && spro->dec1_active) {
 		int s0 = spro->dec1_src0, s1 = spro->dec1_src1;
-		// only registers r2..r7 are real architectural regs
+		// r2 to r7 are the real regs
 		if ((s0 >= 2 && s0 == spro->exec0_dst) ||
 		    (s1 >= 2 && s1 == spro->exec0_dst))
 			data_stall = 1;
-		// DMA uses r[dec1_dst] as the copy length, so dec1_dst is also
-		// effectively a source register for that instruction.
-		if (spro->dec1_opcode == DMA && spro->dec1_dst >= 2 &&
-		    spro->dec1_dst == spro->exec0_dst)
-			data_stall = 1;
 	}
 
-	// Structural hazard on sramd: LD in E0 wants to read while ST in E1
-	// wants to write. The single-port memory (llsim asserts on simultaneous
-	// R/W) forces us to stall the LD by one cycle.
+	// alu producer in exec0 we can forward from (value is e0_aluout). alu ops are ADD to LHI.
+	int e0_alu_fwd = (spro->exec0_active && spro->exec0_dst >= 2 &&
+	                  spro->exec0_opcode <= LHI);
+
+	// exec0 alu (combinational). done before the dec1 operand read so the
+	// forward and the branch resolve can use it.
+	int e0_aluout = 0;
+	if (spro->exec0_active) {
+		switch (spro->exec0_opcode) {
+		case ADD: e0_aluout = spro->exec0_alu0 + spro->exec0_alu1; break;
+		case SUB: e0_aluout = spro->exec0_alu0 - spro->exec0_alu1; break;
+		case LSF: e0_aluout = spro->exec0_alu0 << spro->exec0_alu1; break;
+		case RSF: e0_aluout = spro->exec0_alu0 >> spro->exec0_alu1; break;
+		case AND: e0_aluout = spro->exec0_alu0 & spro->exec0_alu1; break;
+		case OR:  e0_aluout = spro->exec0_alu0 | spro->exec0_alu1; break;
+		case XOR: e0_aluout = spro->exec0_alu0 ^ spro->exec0_alu1; break;
+		case LHI:
+			// keep low 16 of alu0, high 16 from alu1
+			e0_aluout = (spro->exec0_alu1 << 16) | (spro->exec0_alu0 & 0xFFFF);
+			break;
+		case JLT: e0_aluout = (spro->exec0_alu0 <  spro->exec0_alu1) ? 1 : 0; break;
+		case JLE: e0_aluout = (spro->exec0_alu0 <= spro->exec0_alu1) ? 1 : 0; break;
+		case JEQ: e0_aluout = (spro->exec0_alu0 == spro->exec0_alu1) ? 1 : 0; break;
+		case JNE: e0_aluout = (spro->exec0_alu0 != spro->exec0_alu1) ? 1 : 0; break;
+		default:
+			// LD/ST/DMA/CPY/JIN/HLT: no ALU output
+			break;
+		}
+	}
+
+	// value exec1 writes back this cycle. computed once, reused by the forwards
+	// above and by the actual writeback below. alu writes aluout, ld the sramd
+	// dataout, cpy the dma status.
+	int e1_writes_reg = 0, e1_writeval = 0;
+	if (spro->exec1_active && spro->exec1_dst >= 2) {
+		int op = spro->exec1_opcode;
+		if (op <= LHI) {            // alu ops
+			e1_writeval = spro->exec1_aluout;
+			e1_writes_reg = 1;
+		} else if (op == LD) {
+			e1_writeval = llsim_mem_extract_dataout(sp->sramd, 31, 0);
+			e1_writes_reg = 1;
+		} else if (op == CPY) {
+			e1_writeval = (spro->dma_state == DMA_STATE_IDLE) ? 1 : 0;
+			e1_writes_reg = 1;
+		}
+	}
+
+	// structural hazard: a LD read in exec0 and a ST write in exec1 hit the
+	// single port sramd the same cycle, so stall the LD.
 	int struct_stall = (spro->exec0_active && spro->exec0_opcode == LD &&
 	                    spro->exec1_active && spro->exec1_opcode == ST);
 
-	// "front_stall" means F0..D1 must hold this cycle (don't accept new work).
-	// The two stall flavors only differ at E0.
+	// front_stall holds fetch0 to dec1 this cycle. the two stalls only differ at exec0.
 	int front_stall = data_stall || struct_stall;
 
-	// ----- F0: issue I-fetch -----
-	// Predict-not-taken: PC advances by 1 each cycle.
-	// Subtle point about the dataout buffer: when F1 samples at cycle X+1
-	// it reads whatever F0 issued at cycle X. Under no stall, F0's
-	// fetch0_pc[X] becomes F1's fetch1_pc[X+1], so reading fetch0_pc is
-	// exactly what F1 needs. But under stall, fetch1_pc holds — when stall
-	// ends, F1 still wants memory[fetch1_pc] but F0 has been reading the
-	// (held, advanced) fetch0_pc, which would clobber dataout. So during
-	// stall we re-issue the read of fetch1_pc to keep dataout aligned with
-	// what F1 will sample next cycle.
+	// fetch0, issue the instruction read, pc += 1 (predict not taken).
+	// while stalling we re-read fetch1_pc instead of fetch0_pc: fetch1 samples
+	// the srami dataout next cycle and still wants memory[fetch1_pc], so reading
+	// the held/advanced fetch0_pc would clobber it.
 	if (spro->fetch0_active) {
 		int read_addr;
 		if (front_stall && spro->fetch1_active)
@@ -385,9 +392,9 @@ static void sp_ctl(sp_t *sp)
 			sprn->fetch0_pc = (spro->fetch0_pc + 1) & 0xFFFF;
 	}
 
-	// ----- F0 -> F1: latch the PC so F1 next cycle samples the right inst -----
+	// fetch1, latch the pc so fetch1 samples the right inst next cycle
 	if (front_stall) {
-		// hold F1
+		// hold fetch1
 		sprn->fetch1_active = spro->fetch1_active;
 		sprn->fetch1_pc = spro->fetch1_pc;
 	} else {
@@ -395,9 +402,9 @@ static void sp_ctl(sp_t *sp)
 		sprn->fetch1_pc = spro->fetch0_pc;
 	}
 
-	// ----- F1 -> D0: sample the instruction word from srami dataout -----
+	// dec0, sample the inst word from the srami dataout
 	if (front_stall) {
-		// hold D0 — keep last cycle's decoded inst for D0 to see again
+		// hold dec0
 		sprn->dec0_active = spro->dec0_active;
 		sprn->dec0_pc = spro->dec0_pc;
 		sprn->dec0_inst = spro->dec0_inst;
@@ -410,9 +417,9 @@ static void sp_ctl(sp_t *sp)
 			sprn->dec0_inst = 0;
 	}
 
-	// ----- D0 -> D1: bitfield decode -----
+	// dec1, decode the bitfields
 	if (front_stall) {
-		// hold D1 in place
+		// hold dec1
 		sprn->dec1_active = spro->dec1_active;
 		sprn->dec1_pc = spro->dec1_pc;
 		sprn->dec1_inst = spro->dec1_inst;
@@ -429,21 +436,20 @@ static void sp_ctl(sp_t *sp)
 		sprn->dec1_dst    = (spro->dec0_inst >> 22) & 0x7;
 		sprn->dec1_src0   = (spro->dec0_inst >> 19) & 0x7;
 		sprn->dec1_src1   = (spro->dec0_inst >> 16) & 0x7;
-		// 16-bit immediate, sign-extended to 32
+		// 16 bit immediate, sign extended to 32
 		unsigned int imm = spro->dec0_inst & 0xFFFF;
 		if (imm & 0x8000) imm |= 0xFFFF0000;
 		sprn->dec1_immediate = (int) imm;
 	}
 
-	// ----- D1 -> E0: form ALU operands (regfile read with E1 forwarding) -----
-	// We compute alu0/alu1 from spro->dec1_* even when stalling — they're only
-	// committed to sprn->exec0_* in the non-stall branch below.
+	// exec0, read the alu operands (regfile plus forwarding). computed even on a
+	// stall, only latched into exec0 in the non-stall path below.
 	int alu0_val = 0, alu1_val = 0;
 	if (spro->dec1_active) {
 		int s0 = spro->dec1_src0;
 		int s1 = spro->dec1_src1;
 
-		// src field encoding: 0 -> 0, 1 -> immediate, 2..7 -> register
+		// src field: 0 gives 0, 1 gives the immediate, 2 to 7 give a register
 		if (s0 == 0)      alu0_val = 0;
 		else if (s0 == 1) alu0_val = spro->dec1_immediate;
 		else              alu0_val = spro->r[s0];
@@ -452,39 +458,23 @@ static void sp_ctl(sp_t *sp)
 		else if (s1 == 1) alu1_val = spro->dec1_immediate;
 		else              alu1_val = spro->r[s1];
 
-		// E1 forwarding: the instruction in E1 will write its result to the
-		// regfile at end of THIS cycle, becoming visible only next cycle.
-		// To avoid a stall, we forward the value E1 is about to write.
-		if (spro->exec1_active && spro->exec1_dst >= 2) {
-			int op = spro->exec1_opcode;
-			int writeval = 0, will_write = 0;
-			switch (op) {
-			case ADD: case SUB: case LSF: case RSF:
-			case AND: case OR:  case XOR: case LHI:
-				writeval = spro->exec1_aluout; will_write = 1; break;
-			case LD:
-				// LD's data is sitting in sramd's dataout buffer this cycle
-				writeval = llsim_mem_extract_dataout(sp->sramd, 31, 0);
-				will_write = 1;
-				break;
-			case CPY:
-				writeval = (spro->dma_state == DMA_STATE_IDLE) ? 1 : 0;
-				will_write = 1;
-				break;
-			default:
-				break;
-			}
-			if (will_write) {
-				if (s0 >= 2 && s0 == spro->exec1_dst) alu0_val = writeval;
-				if (s1 >= 2 && s1 == spro->exec1_dst) alu1_val = writeval;
-			}
+		// forward from exec1 (it writes the regfile at end of this cycle, only
+		// visible next cycle)
+		if (e1_writes_reg) {
+			if (s0 >= 2 && s0 == spro->exec1_dst) alu0_val = e1_writeval;
+			if (s1 >= 2 && s1 == spro->exec1_dst) alu1_val = e1_writeval;
+		}
+
+		// forward from exec0, which wins over exec1 (younger writer). value is e0_aluout.
+		if (e0_alu_fwd) {
+			if (s0 >= 2 && s0 == spro->exec0_dst) alu0_val = e0_aluout;
+			if (s1 >= 2 && s1 == spro->exec0_dst) alu1_val = e0_aluout;
 		}
 	}
 
-	// Now decide what gets latched into E0:
+	// latch into exec0
 	if (struct_stall) {
-		// hold the LD in E0 — let E1 finish its ST this cycle and reissue
-		// the LD's read next cycle when sramd is free.
+		// hold the LD in exec0, let the ST in exec1 finish, reissue the read next cycle
 		sprn->exec0_active   = spro->exec0_active;
 		sprn->exec0_pc       = spro->exec0_pc;
 		sprn->exec0_inst     = spro->exec0_inst;
@@ -496,8 +486,7 @@ static void sp_ctl(sp_t *sp)
 		sprn->exec0_alu0     = spro->exec0_alu0;
 		sprn->exec0_alu1     = spro->exec0_alu1;
 	} else if (data_stall) {
-		// bubble: producer in E0 will move to E1 (where we can forward),
-		// and a NOP enters E0 in its place. D1 holds.
+		// bubble into exec0, the producer moves to exec1 (forwardable), dec1 holds
 		sprn->exec0_active   = 0;
 		sprn->exec0_pc       = 0;
 		sprn->exec0_inst     = 0;
@@ -509,7 +498,7 @@ static void sp_ctl(sp_t *sp)
 		sprn->exec0_alu0     = 0;
 		sprn->exec0_alu1     = 0;
 	} else {
-		// normal advance D1 -> E0
+		// advance dec1 to exec0
 		sprn->exec0_active   = spro->dec1_active;
 		sprn->exec0_pc       = spro->dec1_pc;
 		sprn->exec0_inst     = spro->dec1_inst;
@@ -520,80 +509,53 @@ static void sp_ctl(sp_t *sp)
 		sprn->exec0_immediate= spro->dec1_immediate;
 		sprn->exec0_alu0     = alu0_val;
 		sprn->exec0_alu1     = alu1_val;
-
-		// DMA latch: when a DMA opcode crosses D1 -> E0 we capture src/dst/len
-		// here and kick the DMA SM. The CPU side proceeds normally — DMA
-		// doesn't stall the pipeline, it just runs in parallel on sramd.
-		if (spro->dec1_active && spro->dec1_opcode == DMA) {
-			int len_reg = spro->dec1_dst;
-			int len_val = (len_reg >= 2) ? spro->r[len_reg] : 0;
-
-			// Apply E1 forwarding to the length read too — the previous
-			// instruction may be writing the length register right now,
-			// and without this we'd see the stale regfile value. The same
-			// E1 forwarding the alu0/alu1 read uses, but for r[dec1_dst].
-			if (spro->exec1_active && spro->exec1_dst == len_reg && len_reg >= 2) {
-				int op = spro->exec1_opcode;
-				switch (op) {
-				case ADD: case SUB: case LSF: case RSF:
-				case AND: case OR:  case XOR: case LHI:
-					len_val = spro->exec1_aluout; break;
-				case LD:
-					len_val = llsim_mem_extract_dataout(sp->sramd, 31, 0);
-					break;
-				case CPY:
-					len_val = (spro->dma_state == DMA_STATE_IDLE) ? 1 : 0;
-					break;
-				default:
-					break;
-				}
-			}
-
-			sprn->dma_src = alu0_val & 0xFFFF;
-			sprn->dma_dst = alu1_val & 0xFFFF;
-			sprn->dma_len = len_val;
-			// only kick the SM if there's actually something to copy
-			if (len_val > 0)
-				sprn->dma_state = DMA_STATE_READ;
-		}
 	}
 
-	// ----- E0 -> E1: ALU compute and LD read issue -----
-	// ALU is combinational on (alu0, alu1, opcode). The result lands in
-	// sprn->exec1_aluout (visible to E1 next cycle).
-	int e0_aluout = 0;
+	// issue the LD read here, sampled in exec1 next cycle. skip on a struct
+	// stall since sramd is busy with the ST.
+	if (spro->exec0_active && spro->exec0_opcode == LD && !struct_stall) {
+		llsim_mem_read(sp->sramd, spro->exec0_alu1 & 0xFFFF);
+	}
+
+	// kick the dma in exec0 (flush safe, only correct path insts get here).
+	// src/dst are the forwarded exec0 operands, len is r[dst] with exec1 forwarding.
+	if (spro->exec0_active && spro->exec0_opcode == DMA) {
+		int len_reg = spro->exec0_dst;
+		int len_val = (len_reg >= 2) ? spro->r[len_reg] : 0;
+		if (e1_writes_reg && len_reg >= 2 && spro->exec1_dst == len_reg)
+			len_val = e1_writeval;
+		sprn->dma_src = spro->exec0_alu0 & 0xFFFF;
+		sprn->dma_dst = spro->exec0_alu1 & 0xFFFF;
+		sprn->dma_len = len_val;
+		if (len_val > 0)
+			sprn->dma_state = DMA_STATE_READ;
+	}
+
+	// resolve branches in exec0: the compare is e0_aluout, so flushing here kills
+	// 4 wrong path slots (fetch0/fetch1/dec0/dec1) instead of 5. the branch still
+	// goes to exec1 to write its link, so don't flush exec1 below.
+	int do_flush = 0, flush_pc = 0;
 	if (spro->exec0_active) {
 		switch (spro->exec0_opcode) {
-		case ADD: e0_aluout = spro->exec0_alu0 + spro->exec0_alu1; break;
-		case SUB: e0_aluout = spro->exec0_alu0 - spro->exec0_alu1; break;
-		case LSF: e0_aluout = spro->exec0_alu0 << spro->exec0_alu1; break;
-		case RSF: e0_aluout = spro->exec0_alu0 >> spro->exec0_alu1; break;
-		case AND: e0_aluout = spro->exec0_alu0 & spro->exec0_alu1; break;
-		case OR:  e0_aluout = spro->exec0_alu0 | spro->exec0_alu1; break;
-		case XOR: e0_aluout = spro->exec0_alu0 ^ spro->exec0_alu1; break;
-		case LHI:
-			// load-high-immediate: keep low 16 of alu0, replace high 16 with alu1
-			e0_aluout = (spro->exec0_alu1 << 16) | (spro->exec0_alu0 & 0xFFFF);
+		case JLT: case JLE: case JEQ: case JNE:
+			if (e0_aluout) {
+				do_flush = 1;
+				flush_pc = spro->exec0_immediate & 0xFFFF;
+			}
 			break;
-		case JLT: e0_aluout = (spro->exec0_alu0 <  spro->exec0_alu1) ? 1 : 0; break;
-		case JLE: e0_aluout = (spro->exec0_alu0 <= spro->exec0_alu1) ? 1 : 0; break;
-		case JEQ: e0_aluout = (spro->exec0_alu0 == spro->exec0_alu1) ? 1 : 0; break;
-		case JNE: e0_aluout = (spro->exec0_alu0 != spro->exec0_alu1) ? 1 : 0; break;
+		case JIN:
+			// indirect jump: always taken
+			do_flush = 1;
+			flush_pc = spro->exec0_alu0 & 0xFFFF;
+			break;
 		default:
-			// LD/ST/DMA/CPY/JIN/HLT: no ALU output
 			break;
-		}
-		// Issue the LD read here (its result is sampled in E1 next cycle).
-		// Skip if a structural stall is happening — sramd is busy with the ST.
-		if (spro->exec0_opcode == LD && !struct_stall) {
-			llsim_mem_read(sp->sramd, spro->exec0_alu1 & 0xFFFF);
 		}
 	}
 
 	if (struct_stall) {
-		// Bubble into E1 next cycle. Without this, we'd advance the held LD
-		// to E1, but it never issued its read this cycle, so its sample
-		// would be garbage. The LD will move forward next cycle instead.
+		// bubble into exec1: the held LD didn't issue its read, so don't advance
+		// it (its sample would be garbage). it moves on next cycle.
 		sprn->exec1_active   = 0;
 		sprn->exec1_pc       = 0;
 		sprn->exec1_inst     = 0;
@@ -606,7 +568,7 @@ static void sp_ctl(sp_t *sp)
 		sprn->exec1_alu1     = 0;
 		sprn->exec1_aluout   = 0;
 	} else {
-		// normal advance E0 -> E1
+		// advance exec0 to exec1
 		sprn->exec1_active   = spro->exec0_active;
 		sprn->exec1_pc       = spro->exec0_pc;
 		sprn->exec1_inst     = spro->exec0_inst;
@@ -620,84 +582,66 @@ static void sp_ctl(sp_t *sp)
 		sprn->exec1_aluout   = e0_aluout;
 	}
 
-	// ----- E1: writeback / memory write / branch resolve / HLT -----
-	int do_flush = 0;
-	int flush_pc = 0;
+	// exec1, writeback / store / link / hlt. branches already resolved in exec0,
+	// so a taken branch here just writes its link.
 	if (spro->exec1_active) {
 		int op = spro->exec1_opcode;
+
+		// regfile writeback (alu/ld/cpy), value computed above
+		if (e1_writes_reg)
+			sprn->r[spro->exec1_dst] = e1_writeval;
+
+		// opcode side effects
 		switch (op) {
-		case ADD: case SUB: case LSF: case RSF:
-		case AND: case OR:  case XOR: case LHI:
-			if (spro->exec1_dst >= 2)
-				sprn->r[spro->exec1_dst] = spro->exec1_aluout;
-			break;
-		case LD:
-			// sample sramd dataout — that's the value E0 fetched last cycle
-			if (spro->exec1_dst >= 2)
-				sprn->r[spro->exec1_dst] = llsim_mem_extract_dataout(sp->sramd, 31, 0);
-			break;
 		case ST:
 			llsim_mem_set_datain(sp->sramd, spro->exec1_alu0, 31, 0);
 			llsim_mem_write(sp->sramd, spro->exec1_alu1 & 0xFFFF);
 			break;
 		case JLT: case JLE: case JEQ: case JNE:
-			// predict-not-taken: only flush when the branch actually goes
-			if (spro->exec1_aluout) {
-				do_flush = 1;
-				flush_pc = spro->exec1_immediate & 0xFFFF;
-				sprn->r[7] = spro->exec1_pc;  // save link
-			}
+			// flushed in exec0, just save the link if taken
+			if (spro->exec1_aluout)
+				sprn->r[7] = spro->exec1_pc;
 			break;
 		case JIN:
-			// indirect jump: always taken, always flushes
-			do_flush = 1;
-			flush_pc = spro->exec1_alu0 & 0xFFFF;
+			// always taken, flushed in exec0
 			sprn->r[7] = spro->exec1_pc;
 			break;
-		case CPY:
-			if (spro->exec1_dst >= 2)
-				sprn->r[spro->exec1_dst] = (spro->dma_state == DMA_STATE_IDLE) ? 1 : 0;
-			break;
 		case DMA:
-			// nothing more to do here — the SM was kicked off at D1 -> E0
+			// already kicked in exec0
 			break;
 		case HLT:
-			// dump both srams, log the trace, halt the simulator
+			// trace, dump both srams and halt
 			update_trace(sp);
 			nr_simulated_instructions++;
 			llsim_stop();
 			dump_sram(sp, "srami_out.txt", sp->srami);
 			dump_sram(sp, "sramd_out.txt", sp->sramd);
-			return;  // skip DMA / flush handling once we've halted
+			return;  // halted, skip the dma/flush below
 		default:
 			break;
 		}
-		// log every retired instruction (HLT was logged & returned above)
+		// trace each retired inst (hlt handled above)
 		update_trace(sp);
 		nr_simulated_instructions++;
 	}
 
-	// ----- Branch flush (overrides the pipe-advance writes from above) -----
-	// Wrong-path instructions are sitting in F0/F1/D0/D1/E0 (5 bubbles worth).
-	// We turn off active in their *next-cycle* slots and redirect F0 to target.
+	// branch flush (overrides the advances above). wrong path insts sit in
+	// fetch0/fetch1/dec0/dec1, clear their next cycle slots and point fetch0 at
+	// the target. leave exec1 alone, the branch retires there.
 	if (do_flush) {
 		sprn->fetch0_active = 1;
 		sprn->fetch0_pc     = flush_pc & 0xFFFF;
 		sprn->fetch1_active = 0;
 		sprn->dec0_active   = 0;
 		sprn->dec1_active   = 0;
-		sprn->exec0_active  = 0;
-		sprn->exec1_active  = 0;  // also kill the E0 inst that would have moved here
+		sprn->exec0_active  = 0;  // kill the wrong path successor
 	}
 
-	// =====================================================================
-	// DMA state machine — runs alongside the CPU, never stalls it.
-	// It uses sramd whenever the CPU isn't, otherwise it backs off.
-	// =====================================================================
+	// dma state machine. runs next to the cpu and uses sramd whenever the cpu
+	// doesn't, otherwise it backs off.
 
-	// The CPU "owns" sramd this cycle if E0 issues an LD read OR E1 issues
-	// an ST write. (struct_stall implies E1 ST issued but E0 LD did NOT, so
-	// it's exactly one access — still busy from DMA's POV.)
+	// cpu owns sramd if exec0 issues a LD read or exec1 issues a ST write.
+	// (struct_stall means ST issued and LD held, so one access, still busy.)
 	int sramd_busy =
 		(spro->exec0_active && spro->exec0_opcode == LD && !struct_stall) ||
 		(spro->exec1_active && spro->exec1_opcode == ST);
@@ -713,9 +657,8 @@ static void sp_ctl(sp_t *sp)
 		}
 		break;
 	case DMA_STATE_WRITE: {
-		// Always latch the dataout into dma_data so a CPU access next cycle
-		// can't clobber what we read. If the CPU is using sramd this cycle
-		// we fall through to FLUSH and retry the write later.
+		// latch dataout now so a cpu access next cycle can't clobber it. if
+		// sramd is busy this cycle, go to FLUSH and retry the write later.
 		int data = llsim_mem_extract_dataout(sp->sramd, 31, 0);
 		sprn->dma_data = data;
 		if (!sramd_busy) {
@@ -731,7 +674,7 @@ static void sp_ctl(sp_t *sp)
 		break;
 	}
 	case DMA_STATE_FLUSH:
-		// Pending write that we couldn't do last cycle — try again.
+		// retry the write we couldn't do last cycle
 		if (!sramd_busy) {
 			llsim_mem_set_datain(sp->sramd, spro->dma_data, 31, 0);
 			llsim_mem_write(sp->sramd, spro->dma_dst & 0xFFFF);
@@ -740,6 +683,8 @@ static void sp_ctl(sp_t *sp)
 			sprn->dma_len = spro->dma_len - 1;
 			sprn->dma_state = (spro->dma_len == 1) ? DMA_STATE_IDLE : DMA_STATE_READ;
 		}
+		break;
+	default:
 		break;
 	}
 }
@@ -793,9 +738,8 @@ static void sp_generate_sram_memory_image(sp_t *sp, char *program_name)
 	}
 }
 
-// Register every pipeline register with llsim so it shows up in any debug
-// dump. The actual DFF copy is handled by llsim's struct-level memcpy at
-// end-of-cycle (see llsim_run_clock), so this is for naming/visibility only.
+// register every pipeline reg with llsim for debug visibility. the dff copy is
+// done by llsim's memcpy at end of cycle, so this is just naming.
 static void sp_register_all_registers(sp_t *sp)
 {
 	sp_registers_t *spro = sp->spro, *sprn = sp->sprn;
@@ -810,7 +754,7 @@ static void sp_register_all_registers(sp_t *sp)
 
 	llsim_register_register("sp", "cycle_counter", 32, 0, &spro->cycle_counter, &sprn->cycle_counter);
 
-	// per-stage pipeline registers
+	// per stage pipeline registers
 	llsim_register_register("sp", "fetch0_active", 1, 0, &spro->fetch0_active, &sprn->fetch0_active);
 	llsim_register_register("sp", "fetch0_pc", 16, 0, &spro->fetch0_pc, &sprn->fetch0_pc);
 
@@ -894,7 +838,7 @@ void sp_init(char *program_name)
 
 	sp->start = 1;
 
-	// register the pipeline registers (purely for debug visibility)
+	// register the pipeline registers for debug visibility
 	sp_register_all_registers(sp);
 
 	// c2v_translate_end
